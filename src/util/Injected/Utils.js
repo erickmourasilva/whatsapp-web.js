@@ -4,6 +4,51 @@ exports.LoadUtils = () => {
     window.WWebJS = {};
 
     /**
+     * Dual-compat serialized id helper.
+     * Older WhatsApp Web builds expose WID/MsgKey as `_serialized`.
+     * Newer builds (e.g. 2.3000.1043xxx) expose the same value as `$1`.
+     * Prefer `_serialized` first so clients that have not updated keep working.
+     * @param {*} wid
+     * @returns {string|undefined}
+     */
+    window.WWebJS.widSerialized = (wid) => {
+        if (!wid || typeof wid === 'string') return wid;
+        return (
+            wid._serialized ??
+            wid.$1 ??
+            (typeof wid.toString === 'function' ? wid.toString() : undefined)
+        );
+    };
+
+    /**
+     * Mirror `$1` onto `_serialized` in plain objects returned to Node so
+     * existing node-side code keeps reading `id._serialized`.
+     * Never overwrites an existing `_serialized` value.
+     * @param {*} obj
+     * @param {number} [depth=0]
+     * @returns {*}
+     */
+    window.WWebJS.normalizeSerialized = (obj, depth = 0) => {
+        if (!obj || typeof obj !== 'object' || depth > 8) return obj;
+        if (Array.isArray(obj)) {
+            for (const item of obj) {
+                window.WWebJS.normalizeSerialized(item, depth + 1);
+            }
+            return obj;
+        }
+        if (obj.$1 !== undefined && obj._serialized === undefined) {
+            obj._serialized = obj.$1;
+        }
+        for (const key of Object.keys(obj)) {
+            const value = obj[key];
+            if (value && typeof value === 'object') {
+                window.WWebJS.normalizeSerialized(value, depth + 1);
+            }
+        }
+        return obj;
+    };
+
+    /**
      * Helper function that compares between two WWeb versions. Its purpose is to help the developer to choose the correct code implementation depending on the comparison value and the WWeb version.
      * @param {string} lOperand The left operand for the WWeb version string to compare with
      * @param {string} operator The comparison operator
@@ -830,13 +875,13 @@ exports.LoadUtils = () => {
 
         if (typeof msg.id.remote === 'object') {
             msg.id = Object.assign({}, msg.id, {
-                remote: msg.id.remote._serialized,
+                remote: window.WWebJS.widSerialized(msg.id.remote),
             });
         }
 
         delete msg.pendingAckUpdate;
 
-        return msg;
+        return window.WWebJS.normalizeSerialized(msg);
     };
 
     window.WWebJS.getChat = async (chatId, { getAsModel = true } = {}) => {
@@ -953,7 +998,7 @@ exports.LoadUtils = () => {
             model.isGroup = true;
             const chatWid = window
                 .require('WAWebWidFactory')
-                .createWid(chat.id._serialized);
+                .createWid(window.WWebJS.widSerialized(chat.id));
             const groupMetadata =
                 window.require('WAWebCollections').GroupMetadata ||
                 window.require('WAWebCollections').WAWebGroupMetadataCollection;
@@ -981,28 +1026,127 @@ exports.LoadUtils = () => {
 
         model.lastMessage = null;
         if (model.msgs && model.msgs.length) {
-            const lastMessage = chat.lastReceivedKey
-                ? window
-                      .require('WAWebCollections')
-                      .Msg.get(chat.lastReceivedKey._serialized) ||
-                  (
-                      await window
-                          .require('WAWebCollections')
-                          .Msg.getMessagesById([
-                              chat.lastReceivedKey._serialized,
-                          ])
-                  )?.messages?.[0]
-                : null;
-            lastMessage &&
-                (model.lastMessage =
-                    window.WWebJS.getMessageModel(lastMessage));
+            try {
+                const lastKeyId = window.WWebJS.widSerialized(
+                    chat.lastReceivedKey,
+                );
+                const lastMessage = lastKeyId
+                    ? window.require('WAWebCollections').Msg.get(lastKeyId) ||
+                      (
+                          await window
+                              .require('WAWebCollections')
+                              .Msg.getMessagesById([lastKeyId])
+                      )?.messages?.[0]
+                    : null;
+                lastMessage &&
+                    (model.lastMessage =
+                        window.WWebJS.getMessageModel(lastMessage));
+            } catch (_) {
+                // Key-format changes must not break the entire chat model
+                model.lastMessage = null;
+            }
         }
 
         delete model.msgs;
         delete model.msgUnsyncedButtonReplyMsgs;
         delete model.unsyncedButtonReplies;
 
-        return model;
+        return window.WWebJS.normalizeSerialized(model);
+    };
+
+    /**
+     * Resolve media blob/metadata for a message id.
+     * Supports older and newer WhatsApp Web builds.
+     * @param {string} msgId
+     * @returns {Promise<{data: string, mimetype: string, filename: string, filesize: number}|null>}
+     */
+    window.WWebJS.downloadMessageMedia = async (msgId) => {
+        if (!msgId) return null;
+
+        const collections = window.require('WAWebCollections');
+        const msg =
+            collections.Msg.get(msgId) ||
+            (await collections.Msg.getMessagesById([msgId]))?.messages?.[0];
+
+        if (!msg || !msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') {
+            return null;
+        }
+
+        // Always attempt internal download: RESOLVED stage can still have
+        // an empty in-memory blob cache after eviction.
+        await msg.downloadMedia({
+            downloadEvenIfExpensive: true,
+            rmrReason: 1,
+            isUserInitiated: true,
+        });
+
+        const stage = msg.mediaData?.mediaStage;
+        if (
+            (typeof stage === 'string' && stage.includes('ERROR')) ||
+            stage === 'FETCHING'
+        ) {
+            return null;
+        }
+
+        let arrayBuffer;
+
+        // Prefer in-memory / mediaObject blob (newer path).
+        try {
+            const cached = window
+                .require('WAWebMediaInMemoryBlobCache')
+                ?.InMemoryMediaBlobCache?.get(msg.mediaObject?.filehash);
+            const blob =
+                cached ||
+                (msg.mediaObject?.mediaBlob?.forceToBlob
+                    ? msg.mediaObject.mediaBlob.forceToBlob()
+                    : null);
+            if (blob) {
+                arrayBuffer = await blob.arrayBuffer();
+            }
+        } catch (_) {
+            // Fall through to DownloadManager path.
+        }
+
+        // Legacy / fallback path used by older WA Web builds.
+        if (!arrayBuffer) {
+            try {
+                const mockQpl = {
+                    addAnnotations: function () {
+                        return this;
+                    },
+                    addPoint: function () {
+                        return this;
+                    },
+                };
+                arrayBuffer = await window
+                    .require('WAWebDownloadManager')
+                    .downloadManager.downloadAndMaybeDecrypt({
+                        directPath: msg.directPath,
+                        encFilehash: msg.encFilehash,
+                        filehash: msg.filehash,
+                        mediaKey: msg.mediaKey,
+                        mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                        type: msg.type,
+                        signal: new AbortController().signal,
+                        downloadQpl: mockQpl,
+                    });
+            } catch (e) {
+                if (e.status && e.status === 404) return null;
+                throw e;
+            }
+        }
+
+        if (!arrayBuffer) return null;
+
+        const data =
+            await window.WWebJS.arrayBufferToBase64Async(arrayBuffer);
+
+        return {
+            data,
+            mimetype: msg.mimetype,
+            filename: msg.filename,
+            filesize: msg.size,
+        };
     };
 
     window.WWebJS.getContactModel = (contact) => {
