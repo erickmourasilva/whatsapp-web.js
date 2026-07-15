@@ -515,14 +515,82 @@ class Message extends Base {
             return undefined;
         }
 
-        // Dual-compat: older builds use `_serialized`, newer WA Web may use `$1`.
+        // Dual-compat: prefer `_serialized` (legacy), fall back to `$1` (newer WA Web).
         const msgId = this.id?._serialized ?? this.id?.$1;
         if (!msgId) {
             return undefined;
         }
 
         const result = await this.client.pupPage.evaluate(async (msgId) => {
-            return await window.WWebJS.downloadMessageMedia(msgId);
+            const msg =
+                window.require('WAWebCollections').Msg.get(msgId) ||
+                (
+                    await window
+                        .require('WAWebCollections')
+                        .Msg.getMessagesById([msgId])
+                )?.messages?.[0];
+
+            // REUPLOADING mediaStage means the media is expired and the download button is spinning, cannot be downloaded now
+            if (
+                !msg ||
+                !msg.mediaData ||
+                msg.mediaData.mediaStage === 'REUPLOADING'
+            ) {
+                return null;
+            }
+            if (msg.mediaData.mediaStage != 'RESOLVED') {
+                // try to resolve media
+                await msg.downloadMedia({
+                    downloadEvenIfExpensive: true,
+                    rmrReason: 1,
+                });
+            }
+
+            if (
+                msg.mediaData.mediaStage.includes('ERROR') ||
+                msg.mediaData.mediaStage === 'FETCHING'
+            ) {
+                // media could not be downloaded
+                return undefined;
+            }
+
+            try {
+                const mockQpl = {
+                    addAnnotations: function () {
+                        return this;
+                    },
+                    addPoint: function () {
+                        return this;
+                    },
+                };
+                const decryptedMedia = await window
+                    .require('WAWebDownloadManager')
+                    .downloadManager.downloadAndMaybeDecrypt({
+                        directPath: msg.directPath,
+                        encFilehash: msg.encFilehash,
+                        filehash: msg.filehash,
+                        mediaKey: msg.mediaKey,
+                        mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                        type: msg.type,
+                        signal: new AbortController().signal,
+                        downloadQpl: mockQpl,
+                    });
+
+                const data =
+                    await window.WWebJS.arrayBufferToBase64Async(
+                        decryptedMedia,
+                    );
+
+                return {
+                    data,
+                    mimetype: msg.mimetype,
+                    filename: msg.filename,
+                    filesize: msg.size,
+                };
+            } catch (e) {
+                if (e.status && e.status === 404) return undefined;
+                throw e;
+            }
         }, msgId);
 
         if (!result) return undefined;
