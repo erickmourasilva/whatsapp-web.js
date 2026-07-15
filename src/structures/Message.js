@@ -538,13 +538,13 @@ class Message extends Base {
             ) {
                 return null;
             }
-            if (msg.mediaData.mediaStage != 'RESOLVED') {
-                // try to resolve media
-                await msg.downloadMedia({
-                    downloadEvenIfExpensive: true,
-                    rmrReason: 1,
-                });
-            }
+
+            // Always resolve media before decrypt. On newer WA Web, stage can
+            // already be RESOLVED while only the thumbnail is available.
+            await msg.downloadMedia({
+                downloadEvenIfExpensive: true,
+                rmrReason: 1,
+            });
 
             if (
                 msg.mediaData.mediaStage.includes('ERROR') ||
