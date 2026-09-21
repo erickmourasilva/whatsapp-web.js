@@ -528,6 +528,13 @@ exports.LoadUtils = () => {
             ...extraOptions,
         };
 
+        // MediaData is a model whose private ID field (__x_id) collides with
+        // Msg's private ID when its enumerable properties are spread above.
+        // Newer WA Web then fails getValidatedSender/getSender with:
+        // "Data passed to getter must include an id property ... but got undefined"
+        // See https://github.com/wwebjs/whatsapp-web.js/issues/201922
+        delete message.__x_id;
+
         // Bot's won't reply if canonicalUrl is set (linking)
         if (botOptions) {
             delete message.canonicalUrl;
