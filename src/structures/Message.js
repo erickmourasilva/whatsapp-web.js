@@ -572,6 +572,10 @@ class Message extends Base {
                         mediaKey: msg.mediaKey,
                         mediaKeyTimestamp: msg.mediaKeyTimestamp,
                         type: msg.type,
+                        // Required on newer WA Web; omitting defaults to
+                        // application/octet-stream and throws InvalidMediaFileType (t: t).
+                        // See https://github.com/wwebjs/whatsapp-web.js/issues/201908
+                        mimetype: msg.mimetype,
                         signal: new AbortController().signal,
                         downloadQpl: mockQpl,
                     });
