@@ -122,6 +122,8 @@ class Client extends EventEmitter {
             await this.pupPage
                 .waitForFunction('window.Debug?.VERSION != undefined', {
                     timeout: authTimeout,
+                    // Default 'raf' polling stalls when animation callbacks stop (headless)
+                    polling: 200,
                     signal: abort.signal,
                 })
                 .catch((err) => {
@@ -153,7 +155,8 @@ class Client extends EventEmitter {
                         state,
                     };
                 },
-                { timeout: authTimeout },
+                // Default 'raf' polling stalls when animation callbacks stop (headless)
+                { timeout: authTimeout, polling: 200 },
             );
             const needAuthentication = await needAuthHandle.jsonValue();
 
