@@ -34,7 +34,7 @@ const {
     ScheduledEvent,
 } = require('./structures');
 const NoAuth = require('./authStrategies/NoAuth');
-const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
+const { exposeFunctionIfAbsent, pollPageUntil } = require('./util/Puppeteer');
 
 /**
  * Starting point for interacting with the WhatsApp Web API
@@ -114,18 +114,17 @@ class Client extends EventEmitter {
     async inject() {
         // Cancel any previous inject still running
         if (this._injectAbort) this._injectAbort.abort();
+        if (this._socketWaitAbort) this._socketWaitAbort.abort();
         const abort = new AbortController();
         this._injectAbort = abort;
 
         try {
             const authTimeout = this.options.authTimeoutMs || 30000;
-            await this.pupPage
-                .waitForFunction('window.Debug?.VERSION != undefined', {
-                    timeout: authTimeout,
-                    // Default 'raf' polling stalls when animation callbacks stop (headless)
-                    polling: 200,
-                    signal: abort.signal,
-                })
+            await pollPageUntil(
+                this.pupPage,
+                () => window.Debug?.VERSION != undefined,
+                { timeout: authTimeout, signal: abort.signal },
+            )
                 .catch((err) => {
                     if (abort.signal.aborted) throw err;
                     throw 'auth timeout';
@@ -138,10 +137,16 @@ class Client extends EventEmitter {
             const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
             const version = await this.getWWebVersion();
 
-            const needAuthHandle = await this.pupPage.waitForFunction(
+            const needAuthentication = await pollPageUntil(
+                this.pupPage,
                 () => {
                     const state =
                         window.require?.('WAWebSocketModel')?.Socket?.state;
+                    // Recent WA Web builds don't register WAWebSocketModel on the
+                    // /login/ page. An unpaired page already has a QR ref in Conn.
+                    if (!state && window.require?.('WAWebConnModel')?.Conn?.ref) {
+                        return { need: true, state: 'UNPAIRED' };
+                    }
                     if (
                         !state ||
                         state === 'OPENING' ||
@@ -155,10 +160,8 @@ class Client extends EventEmitter {
                         state,
                     };
                 },
-                // Default 'raf' polling stalls when animation callbacks stop (headless)
-                { timeout: authTimeout, polling: 200 },
+                { timeout: authTimeout, signal: abort.signal },
             );
-            const needAuthentication = await needAuthHandle.jsonValue();
 
             if (needAuthentication.need) {
                 const { failed, failureEventPayload, restart } =
@@ -264,7 +267,7 @@ class Client extends EventEmitter {
                         // Remove QR listener once authentication succeeds
                         window
                             .require('WAWebSocketModel')
-                            .Socket.on('change:hasSynced', () => {
+                            ?.Socket?.on('change:hasSynced', () => {
                                 window
                                     .require('WAWebConnModel')
                                     .Conn.off('change:ref', onRefChange);
@@ -390,72 +393,100 @@ class Client extends EventEmitter {
                         .catch((_) => _);
                 },
             );
-            await this.pupPage.evaluate(() => {
-                const Socket = window.require('WAWebSocketModel').Socket;
+            // Recent WA Web builds don't expose WAWebSocketModel on the /login/ page.
+            // Returns false when it isn't available yet so the caller can retry later.
+            const attachSocketListeners = () =>
+                this.pupPage.evaluate(() => {
                 const Cmd = window.require('WAWebCmd').Cmd;
+                const registerListeners = (Socket) => {
+                    const listeners = [
+                        [
+                            Socket,
+                            'change:state',
+                            (_AppState, state) => {
+                                window.onAuthAppStateChangedEvent(state);
+                            },
+                        ],
+                        [
+                            Socket,
+                            'change:hasSynced',
+                            () => {
+                                window.onAppStateHasSyncedEvent();
+                            },
+                        ],
+                        [
+                            Cmd,
+                            'offline_progress_update_from_bridge',
+                            () => {
+                                window.onOfflineProgressUpdateEvent(
+                                    window
+                                        .require('WAWebOfflineHandler')
+                                        .OfflineMessageHandler.getOfflineDeliveryProgress(),
+                                );
+                            },
+                        ],
+                        [
+                            Cmd,
+                            'logout',
+                            async () => {
+                                await window.onLogoutEvent();
+                            },
+                        ],
+                        [
+                            Cmd,
+                            'logout_from_bridge',
+                            async () => {
+                                await window.onLogoutEvent();
+                            },
+                        ],
+                    ];
 
-                const listeners = [
-                    [
-                        Socket,
-                        'change:state',
-                        (_AppState, state) => {
-                            window.onAuthAppStateChangedEvent(state);
-                        },
-                    ],
-                    [
-                        Socket,
-                        'change:hasSynced',
-                        () => {
-                            window.onAppStateHasSyncedEvent();
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'offline_progress_update_from_bridge',
-                        () => {
-                            window.onOfflineProgressUpdateEvent(
-                                window
-                                    .require('WAWebOfflineHandler')
-                                    .OfflineMessageHandler.getOfflineDeliveryProgress(),
-                            );
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'logout',
-                        async () => {
-                            await window.onLogoutEvent();
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'logout_from_bridge',
-                        async () => {
-                            await window.onLogoutEvent();
-                        },
-                    ],
-                ];
-
-                // Clean up old listeners to prevent accumulation on re-inject
-                if (window._wwjsListeners) {
-                    for (const [obj, event, handler] of window._wwjsListeners) {
-                        obj.off(event, handler);
+                    // Clean up old listeners to prevent accumulation on re-inject
+                    if (window._wwjsListeners) {
+                        for (const [obj, event, handler] of window._wwjsListeners) {
+                            obj.off(event, handler);
+                        }
                     }
-                }
 
-                for (const [obj, event, handler] of listeners) {
-                    obj.on(event, handler);
-                }
-                window._wwjsListeners = listeners;
+                    for (const [obj, event, handler] of listeners) {
+                        obj.on(event, handler);
+                    }
+                    window._wwjsListeners = listeners;
 
-                // Atomic hasSynced check in the same synchronous block as listener registration.
-                // If hasSynced is already true, Backbone won't fire change:hasSynced (no transition).
-                // If hasSynced is false, the listener above will catch the future transition.
-                const storeInjected = typeof window.WWebJS !== 'undefined';
-                if (Socket.hasSynced === true && !storeInjected) {
-                    window.onAppStateHasSyncedEvent();
-                }
+                    // Atomic hasSynced check in the same synchronous block as listener registration.
+                    // If hasSynced is already true, Backbone won't fire change:hasSynced (no transition).
+                    // If hasSynced is false, the listener above will catch the future transition.
+                    const storeInjected = typeof window.WWebJS !== 'undefined';
+                    if (Socket.hasSynced === true && !storeInjected) {
+                        window.onAppStateHasSyncedEvent();
+                    }
+                };
+
+                const Socket = window.require?.('WAWebSocketModel')?.Socket;
+                if (!Socket) return false;
+                registerListeners(Socket);
+                return true;
             });
+
+            if (this._socketWaitAbort) this._socketWaitAbort.abort();
+            if (!(await attachSocketListeners())) {
+                // Not on the page yet (unpaired /login/ page). Don't block inject():
+                // wait from Node and attach as soon as the Socket model shows up.
+                const socketWait = new AbortController();
+                this._socketWaitAbort = socketWait;
+                pollPageUntil(
+                    this.pupPage,
+                    () => !!window.require?.('WAWebSocketModel')?.Socket,
+                    { timeout: Infinity, signal: socketWait.signal },
+                )
+                    .then(() => attachSocketListeners())
+                    .catch(() => {}) // aborted, page closed or navigated away
+                    .finally(() => {
+                        if (this._socketWaitAbort === socketWait) {
+                            this._socketWaitAbort = null;
+                        }
+                    });
+            }
         } catch (err) {
             if (abort.signal.aborted) return; // superseded by newer inject
             throw err;
@@ -1336,6 +1367,7 @@ class Client extends EventEmitter {
      */
     async destroy() {
         if (this._injectAbort) this._injectAbort.abort();
+        if (this._socketWaitAbort) this._socketWaitAbort.abort();
         this._framenavigatedRegistered = false;
 
         const browser = this.pupBrowser;
